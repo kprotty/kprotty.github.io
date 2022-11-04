@@ -1,12 +1,8 @@
----
-title: "Simple, Scalable, Unbounded Queue"
----
-
 The thing I love most about programming over the years has always been design and optimization work. This is what got me into compilers, garbage collectors, runtimes, schedulers, and eventually [databases](https://twitter.com/kingprotty/status/1567602181074829317). Nothing gets me more excited than tag-teaming with someone to research, test, benchmark, and go down various rabbit holes with the goal of making something cool. In this case, I've decided to share one of the results!
 
 ## Context
 
-For those unitiated, a "channel" refers to a type of queue generally used in a programming language for passing data from one concurrent task to another with extra amenities. At least, this is how I describe it. I'll be using the term interchangeably with "queue" from now on. There's a few different properties of channels that help categorize them for use and comparisons: 
+For those uninitiated, a "channel" refers to a type of queue generally used in a programming language for passing data from one concurrent task to another with extra amenities. At least, this is how I describe it. I'll be using the term interchangeably with "queue" from now on. There's a few different properties of channels that help categorize them for use and comparisons: 
 
 **Bounded or Unbounded**. This describes whether or not the channel has a maximum capacity of stuff it can have in it which hasn't been dequeued. Channels with a bound will either be **Blocking or Non-Blocking**. Blocking channels will pause the caller until it can interact with the channel whereas non-blocking channels will return immediately with some sort of error.
 
@@ -44,7 +40,7 @@ When a producer observes that all buffer slots have been reserved to be written 
 
 **Option 2.** Everyone allocates their own new buffer and tries to install it to the producer. This eliminates the chance of a producer blocking but can increase memory pressure as at most `255` producers could potentially allocate their own buffer and `254` would have to free it when one wins the install race. We can do better than that..
 
-**Option 3.** Someone installs the new buffer somewhere else and everyone helps update the producer with it. This solves a bunch of stuff: It doesn't block like before and having a relatively uncontended place that can be observed before deciding to allocate a buffer menas less memory pressure for the consumer. Everyone helping to install the same buffer also means that less producers will see the overflow state.
+**Option 3.** Someone installs the new buffer somewhere else and everyone helps update the producer with it. This solves a bunch of stuff: It doesn't block like before and having a relatively uncontended place that can be observed before deciding to allocate a buffer means less memory pressure for the consumer. Everyone helping to install the same buffer also means that less producers will see the overflow state.
 
 ## Merging
 
@@ -64,7 +60,7 @@ We introduce a counter on the buffer called `.pending`. If a thread loses the ra
 
 The thread which wins the race for installing the new buffer will know how many other threads saw/accessed the old buffer from the overflowed index. It will then *increment* (the opposite of others) that amount from the old buffer's `.pending`. This will cancel out the decrements from the losing producers as well as the consumer which represents the winner's count. Any thread which changes `.pending` to 0 will be the one to free the buffer.
 
-One final edge case is when there is no *"old buffer"*. This happens for the first enqueue by the proudcers. Here, the losing producers just retry FAA without doing anything and the winning producer increments the `.pending` count with 1 instead to account for and cancel out the consumer doing the same when it finds the next buffer.
+One final edge case is when there is no *"old buffer"*. This happens for the first enqueue by the producers. Here, the losing producers just retry FAA without doing anything and the winning producer increments the `.pending` count with 1 instead to account for and cancel out the consumer doing the same when it finds the next buffer.
 
 I cannot overstate how simple and effective of an idea this is. A single atomic RMW operation is used to both reserve a slot to write *AND* to increment a reference count to track active users. In the paper, their algorithm is actually *multi-consumer* so it does a few more tricks to make concurrent reclamation work but the idea is the same.
 
@@ -176,7 +172,7 @@ If you can't beat 'em, join 'em. The queue implementation can be specialized jus
 
 A post about writing scalable algorithms can't be complete without benchmarks. I've implemented the original FAA algorithm and the specialized algorithm then put them up against well known channels in the Rust ecosystem like [`crossbeam`](https://github.com/crossbeam-rs/crossbeam/tree/master/crossbeam-channel), [`flume`](https://github.com/zesterer/flume), and Rust's standard library mpsc.
 
-One method of benchmarking channels is to spawn N producer threads which each send a fixed amount of items, then recv all of the items on the consumer thread. I believe this doesn't measure throughput correctly: Spawn could switch to a producer thread and send its entire amount before spawning the next. Producers could complete sooner than the consumer and now it only benchmarks the consumer. Producers could yield on contention, let the other go through its amount, and finish its amount without contention.
+One method of benchmarking channels is to spawn N producer threads which each send a fixed amount of items, then receive all of the items on the consumer thread. I believe this doesn't measure throughput correctly: Spawn could switch to a producer thread and send its entire amount before spawning the next. Producers could complete sooner than the consumer and now it only benchmarks the consumer. Producers could yield on contention, let the other go through its amount, and finish its amount without contention.
 
 To properly measure contention, the producer and consumer run for a fixed amount of time (one second at the moment) instead of for a fixed amount of items. This allows producers to contend with each other. Couple this with a [`Barrier`](https://doc.rust-lang.org/std/sync/struct.Barrier.html) to ensure everyone is running only when they've all been spawned, producers can race with the consumer and possibly have the latter out-run the former and hit the slow/blocking path.
 
@@ -199,6 +195,6 @@ We're not through with trying to be thorough! Channel benchmarks will also only 
 
 ## Disconnecting
 
-Thanks for reading all the way through and totally not skipping to the end (👀 right?). Anyways, I've published this channel implementation, as wel as the benchmarks, in a Rust crate called [`uchan`](https://crates.io/crates/uchan). Check out my other crates as well: [`usync`](https://crates.io/crates/usync) for word-sized sync primitives and [`uasync`](https://crates.io/crates/uasync) for an `unsafe`-free, dependency-free, async runtime.
+Thanks for reading all the way through and totally not skipping to the end (👀 right?). Anyways, I've published this channel implementation, as well as the benchmarks, in a Rust crate called [`uchan`](https://crates.io/crates/uchan). Check out my other crates as well: [`usync`](https://crates.io/crates/usync) for word-sized sync primitives and [`uasync`](https://crates.io/crates/uasync) for an `unsafe`-free, dependency-free, async runtime.
 
 Oh yea, I have a [Ko-Fi](https://ko-fi.com/kprotty) now so, if you're interested, you can buy me a ~~coffee~~ ~~beer~~ cloud VPS instance to run more benchmarks. Otherwise, you can find me on [twitter](https://twitter.com/kingprotty) or in the Rust/Zig community discords/reddits. I still haven't covered _bounded_ channels yet (and I gots some ideas brewing) so stay tuned.
