@@ -2,8 +2,6 @@
 title: "libuv, but multi-threaded, but not really"
 ---
 
-> **Note**: This was started on January 24, 2023 and finished today at random. Keep that in mind.
-
 What gained popularity as a [LIGMA](https://twitter.com/kingprotty/status/1601991514942488582) 
 joke on Twitter morphed into a project I've begun to really consider.
 
