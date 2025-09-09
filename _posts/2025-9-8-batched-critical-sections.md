@@ -9,7 +9,7 @@ Critical sections don't have to be scheduler-bottlenecked.
 First off, a critical section is just a piece of code that multiple threads want to run, but only one thread at a time is allowed to execute. The most obvious way to achieve this is through a Mutex, but it's not really ideal:
 
 The flow of protected code through a Mutex looks like this:
-```c
+```rs
 update(t1) // locked
 wake(t2): // unlock
     update(t2)
@@ -19,7 +19,7 @@ wake(t2): // unlock
 Each indentation level represents a different thread, where it must wait to be scheduled after its parent's `wake`. This sucks because the critical sections we care about (the `update` calls) are separated by points that wait for the scheduler to start running a woken-up thread.
 
 What if instead, you run all the updates together on one thread, then do the `wake`s after? It would remove the dependency on the scheduler's decision to run us entirely:
-```c
+```rs
 update(t1)
 update(t2)
 update(t3)
@@ -32,7 +32,7 @@ I've started calling this pattern **Batched Critical Sections** (BCS).
 People already do this. Well.. something close it with [Actors](https://en.wikipedia.org/wiki/Actor_model). 
 
 Under this model, there's a Multi-Producer Single-Consumer (MPSC) queue where many threads push data/operations (messages) while a single consumer thread continuously pops and handles them:
-```c
+```rs
 can_be_in_parallel { push(t1), push(t2), push(t2) }
 wake(consumer):
     update(t1)
@@ -42,7 +42,7 @@ wake(consumer):
 ```
 
 It's the right start, but there's still that scheduler dependency for the consumer thread to be woken up and start popping. Turns out you can just skip that; Instead of another consumer thread, the first thread to push when the queue is empty **becomes the consumer**, popping & handling messages as the critical section until the queue is empty. So as pseudo code:
-```c
+```rs
 submit(t1):
   was_empty = mpsc.push(t1)
   if was_empty:
