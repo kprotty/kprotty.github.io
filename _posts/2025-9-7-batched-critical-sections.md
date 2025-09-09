@@ -16,9 +16,9 @@ wake(t2): // unlock
     wake(t3):
         update(t3)
 ```
-Each indentation level represents a different thread, where it must wait to be scheduled after its parent's `wake`. This sucks because the critical sections we care about (the `update` calls) are separated by points that wait for the scheduler to start running a woken up thread.
+Each indentation level represents a different thread, where it must wait to be scheduled after its parent's `wake`. This sucks because the critical sections we care about (the `update` calls) are separated by points that wait for the scheduler to start running a woken-up thread.
 
-What if, instead, you run all the updates together on one thread, then do the `wake`s after? It would remove the dependency on the scheduler's decision to run us entirely:
+What if instead, you run all the updates together on one thread, then do the `wake`s after? It would remove the dependency on the scheduler's decision to run us entirely:
 ```c
 update(t1)
 update(t2)
@@ -31,7 +31,7 @@ I've started calling this pattern **Batched Critical Sections** (BCS).
 ### How would you do that?
 People already do this. Well.. something close it with [Actors](https://en.wikipedia.org/wiki/Actor_model). 
 
-Under this model, there's a Multi-Producer Single-Consumer (MPSC) queue where many threads can push data/operations (messages) while a single consumer thread continuously pops and handles them:
+Under this model, there's a Multi-Producer Single-Consumer (MPSC) queue where many threads push data/operations (messages) while a single consumer thread continuously pops and handles them:
 ```c
 can_be_in_parallel { push(t1), push(t2), push(t2) }
 wake(consumer):
@@ -41,7 +41,7 @@ wake(consumer):
     can_be_in_parallel { wake(t1), wake(t2), wake(t3) }
 ```
 
-It's the right start, but there's still that scheduler dependency on waking the consumer thread to pop. Turns out you can just skip that; Instead of another consumer thread, the first thread to push when the queue is empty **becomes the consumer**, popping & handling messages as the critical section until the queue is empty. So as pseudo code:
+It's the right start, but there's still that scheduler dependency for the consumer thread to be woken up and start popping. Turns out you can just skip that; Instead of another consumer thread, the first thread to push when the queue is empty **becomes the consumer**, popping & handling messages as the critical section until the queue is empty. So as pseudo code:
 ```c
 submit(t1):
   was_empty = mpsc.push(t1)
@@ -60,7 +60,7 @@ t2: push(t2), was_empty=True, pops t2
 
 ### Is there a fix?
 
-Yea. The consumer needs support a two-phase `pop()` process, where it first observes a message then marks it as popped after handling it. Rather than showing another abstract version of that, let's just get into a concrete implementation:
+Yeah. The consumer needs support a two-phase `pop()` process, where it first _observes_ a message then _marks_ it as popped after handling it. Rather than showing another abstract version of that, let's just get into a concrete implementation:
 
 <details>
 <summary>Intrusive, Lock-Free, BCS </summary>
@@ -103,30 +103,27 @@ struct Queue:
 ```
 
 </details>
-
-<hr />
+<br />
 
 That's it. 
 
 That's the whole alg. It has some nice properties too:
 
-* The critical section (`handle`) is allowed to invalidate the nodes. So a decision to immediately `wake`, or defer the `wake`, can be made per-node.
-* Critical section state can be threaded through `Queue.top` by representing the "empty" state, as long as it fits in a pointer and is distinguishable from submitted node pointers.
+* The critical section (`handle`) is allowed to invalidate the nodes. So the decision on how to `wake` (immediately or deferred) can be made per-node.
+* Critical section state can be threaded through `Queue.top` as the "empty" state representation, as long as it fits in a pointer and is distinguishable from submitted node pointers.
 
 I want to further emphasize that this is more than just a _"better Mutex"_ algorithm; **It's a concurrency pattern**. Particularly useful for protecting _other_ intrusive data structures like queues or graphs.
 
-For example, submit a waiter to a wait-queue, a callback node to an `io_uring` instance, or a timer node to a tree. Basically, anywhere you'd use a Mutex or an MPSC channel. It's asynchronous by default and can optionally be made synchronous by waiting on what's submitted (waking it when it's handled by the critical section).
+For example, submit a waiter to a wait-queue, a callback + SQE pair to an `io_uring` instance, or a timer node to a priority-queue. Basically, anywhere you'd use a Mutex or an MPSC channel, you can also use BCS. It's asynchronous by default and can optionally be made synchronous by waiting on what's submitted (waking it when it's handled by the critical section).
 
 > **Sidenote**: 
-> It's wild that the OS with the best thread park/unpark API for this is NetBSD of all things. Batched Critical Sections use the [Event](https://kprotty.me/2025/07/31/sync-primitives-are-functionally-complete.html) pattern i've described prior. And only Windows & NetBSD support that natively, with the latter having [`lwp_unpark_all()`](https://man.netbsd.org/_lwp_unpark_all.2) for batched `wake()`. Everyone else uses [`futex`](https://en.wikipedia.org/wiki/Futex) as the lowest-level park/unpark primitive.
+> It's wild that the OS with the best thread park/unpark API for this is NetBSD of all things. Batched Critical Sections use the [Event](https://kprotty.me/2025/07/31/sync-primitives-are-functionally-complete.html) pattern I've described prior. And only Windows & NetBSD support that natively, with the latter having [`lwp_unpark_all()`](https://man.netbsd.org/_lwp_unpark_all.2) for batched `wake()`. Everyone else uses [`futex`](https://en.wikipedia.org/wiki/Futex) as the lowest-level park/unpark primitive — which isn't bad, just odd.
 
 ### Can it be faster?
 
 With some trade-offs? Sort of.
 
-The main area for improvement is that `submit()` is currently lock-free when it could be wait-free. BCS at it's core is just an intrusive lock-free MPSC. So let's instead take inspiration from another intrusive _wait-free_ MPSC:
-
-The [Vyukov Queue](https://int08h.com/post/ode-to-a-vyukov-queue/) is just that, distilled to only the necessary operations. Here's it adapted into a more traditional API:
+The main area for improvement is that `submit()` is currently lock-free when it could be wait-free. BCS at its core is just an intrusive lock-free MPSC. So let's instead take inspiration from another intrusive _wait-free_ MPSC: The [Vyukov Queue](https://int08h.com/post/ode-to-a-vyukov-queue/). Here's it adapted into a more traditional API:
 
 <details>
 <summary>Intrusive, Wait-Free, MPSC</summary>
@@ -162,12 +159,13 @@ struct Queue:
 ```
 
 </details>
+<br />
 
-A quirk of this queue is that it introduces a new failure mode for the consumer: `ProducerStalled`. This happens when the consumer is on some/last node, a producer pushes a new one to tail with `swap`, but hasn't yet linked it to the previous tail with `store`. 
+A quirk of the Vyukov MPSC is that it introduces a new failure mode for the consumer: `ProducerStalled`. This happens when the consumer is on some node and a producer pushes a new one to tail with `swap` but hasn't yet linked it to the previous tail with `store`. 
 
-Given the window for this to happen is so small (like a few instructions), most Vyukov queue implementations spin on the that `prev_tail.next` until the producer sets it, relying on OS preemption or parallelism to eventually make it visible. While that probably works in practice, unbounded spinning technically downgrades the forward progress guarantess from "_Wait Free_" to "_Blocking_" which is cringe.
+Given the window for this to happen is so small (like a few instructions), most Vyukov queue implementations spin on the that `prev_tail.next` until the producer sets it, relying on OS preemption or parallelism to eventually make it visible. While that probably works in practice, unbounded spinning technically downgrades the forward progress guarantess of the alg from "_Wait Free_" to "_Blocking_" which is cringe.
 
-But when adapted to BCS, we can work around it; When the consumer gets into that case, it will atomically swap `prev_tail.next` with some sentinel. The producer side also now links to previous tail with a `swap`. If the consumer sees the producer's swap, it continues with the next node as normal. If not, the consumer returns and knows the producer will see sentinel to continue where it left off as the _new consumer_.
+But if reframed for BCS, we can work around it; When the consumer gets into that case, it will atomically swap `prev_tail.next` with some [sentinel](https://en.wikipedia.org/wiki/Sentinel_value). The producer also now links to previous tail with a `swap`. If the consumer sees the producer's swap, it continues with the next node as normal. If not, the consumer returns and the producer will become _the new consumer_ upon seeing the sentinel, picking up from where it left off.
 
 <details>
 <summary>Intrusive, Wait-Free, BCS</summary>
@@ -202,21 +200,33 @@ struct Queue:
 ```
 
 </details>
+<br />
 
 The tradeoff is that the critical section (`handle`) can no longer invalidate the nodes. But this is usually fine as the invalidation points are still explicit and happen during the consumer's ownership period (exclusing the last node). 
 
-If you really wanted that property however, it can still be done; Observe `node.next` first & if null do the `tail.cmpxchg` but to a stub node instead of null. On success, `handle(last_node)` as usual, then `tail.cmpxchg(stub, null)` to complete. Failing this does the handoff as usual, but the new consumer skips handling the `stub`. The stub node itself must live longer than the last dequeue so itll probably need to live in the Queue itself. But with this, `handle` should now support node invalidation.
+But if you really wanted that property, it can still be done; Observe `node.next` first & if null do the `tail.cmpxchg` but to a stub node instead of null. On success, `handle(last_node)` as usual, then `tail.cmpxchg(stub, null)` to complete. Failing this does the handoff as usual, but the new consumer skips handling the `stub` (which BTW must live longer than the last dequeue, so probably stored in the Queue itself). With this, `handle` should now support node invalidation.
 
 ### Ok. Any good in practice?
 
-Yes.
+It depends™
 
-I implemented a mutex-like critical section with both BCS variants in Rust and benchmarked it against other mutex-based ones like `std::sync::Mutex`, `parking_lot::Mutex`, and `pthread_mutex_t/SRWLOCK`. 
+I wrote a mutex-like critical section with both BCS variants in Rust and benchmarked it against other mutex-based ones like `std::sync::Mutex`, `parking_lot::Mutex`, and `pthread_mutex_t/SRWLOCK/os_unfair_lock`: https://github.com/kprotty/bcs
 
-The hypothesis was that it should have around the same throughput as [unfair locks](https://www.intel.com/content/www/us/en/docs/onetbb/developer-guide-api-reference/2021-6/mutex-flavors.html) but with better fairness from queued critical sections being processed in FIFO order instead of scheduler-preference order. 
+The hypothesis going in was that it should have around the same throughput as the [unfair locks](https://www.intel.com/content/www/us/en/docs/onetbb/developer-guide-api-reference/2021-6/mutex-flavors.html) but with better fairness from the queued critical sections being processed in FIFO order instead of scheduler-preference order. 
 
-[Async Mutex use]
+What really ended up happening was this but with caveats; The BCS locks were indeed the fairest ones measured, but their throughput in this benchmark was hampered by the fact that every critical section _must_ be followed by an OS thread `wake`. 
+
+Most mutexes are unfair, allowing an unlocker to re-acquire even if others are waiting. After the first unlock `wake`, subsequent lock/unlock cycles don't `wake` anymore until that woken-up waiter (or a new one) sees it's locked again and goes back to sleep. Combine these together and it means short critical sections result in fewer/amortized `wake`s (this is covered in my [ThreadPool](https://kprotty.me/2021/09/12/resource-efficient-thread-pools-with-zig.html#notification-throttling) post as well).
+
+BCS (the high-level pattern) simply can't do that. Or rather, if it was adapted to then it would effectively just be [`usync`](https://crates.io/crates/usync) (a fast mutex I wrote a while back derived from the [Queued-Locks](https://kprotty.me/2022/09/19/building-a-tiny-mutex.html#queued-locks) post) where the [`QUEUE_LOCKED`](https://github.com/kprotty/usync/blob/ccaf9a7f83ebf495ef684143b7414f2df2b075b0/src/rwlock.rs#L14) bit acts as the "consumer" ownership state.
+
+But for longer critical sections relative to `submit/lock`s, the `wake` amortization no longer applies and BCS ends up having **equal or higher throughput** while still being the most fair.
+
+Moral of the story? If you really want to wake on every critical section, just use a Mutex. If not (which is basically everything else & the original purpose of a Mutex), use BCS.
 
 ### I want to use it.
 
-[Library, Code]
+I tried exposing BCS as a library but it just didnt fit when being used as a Mutex. Remember: BCS is a pattern so it's best applied to the context of a specific problem (in this case: Mutex roleplay).
+
+It's like linked lists; nobody using them practically does so through a general-purpose library. It's always specialized to the use-case at hand. So figure out what you can scavenge from this post and get your hands dirty.
+
